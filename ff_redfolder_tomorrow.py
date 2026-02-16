@@ -12,15 +12,15 @@ FF_XML_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 FF_XML_NEXTWEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.xml"
 
 # ---- TIMEZONES ----
-FF_TZ = tz.gettz("America/Chicago")
-USER_TZ = tz.gettz("America/Los_Angeles")
+FF_TZ = tz.gettz("America/Chicago")        # FF feed commonly aligns to Chicago time
+USER_TZ = tz.gettz("America/Los_Angeles")  # output in PT
 
-MAX_DISCORD_CHARS = 1900  # keep under Discord 2000 char limit
+MAX_DISCORD_CHARS = 1900
 
 def discord_post(webhook_url: str, content: str) -> None:
     payload = {
         "content": content,
-        "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone ping
+        "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone ping (if server permits)
     }
     r = requests.post(webhook_url, json=payload, timeout=20)
     r.raise_for_status()
@@ -91,20 +91,22 @@ def get_feed_events(json_url: str, xml_url: str):
     print("Falling back to XML for this feed...")
     return fetch_events_from_xml(xml_url)
 
-def is_high_impact(impact) -> bool:
+def is_red_folder(impact) -> bool:
+    """
+    ForexFactory exports aren't always consistent.
+    We treat these as red-folder/high impact:
+    - contains 'high' or 'red'
+    - equals '3'
+    - contains 'highimpact'
+    """
     s = str(impact or "").strip().lower()
-    return s in ("high", "red", "high impact", "3", "highimpact")
-
-def impact_label(impact) -> str:
-    # Make the “red folder” explicit in the message
-    if is_high_impact(impact):
-        return "🔴 Red (High Impact)"
-    return "Impact"
+    if s == "3":
+        return True
+    return ("high" in s) or ("red" in s) or ("highimpact" in s)
 
 def parse_event_dt_ff(e):
     """
-    Return (dt_ff, time_known_bool). dt_ff timezone-aware in FF_TZ.
-    If time is missing/tentative, time_known_bool=False and dt_ff becomes 00:00.
+    Return (dt_ff, time_known_bool) in FF_TZ.
     """
     ts = e.get("timestamp") or e.get("ts") or e.get("timeStamp")
     if ts is not None and str(ts).strip().isdigit():
@@ -124,14 +126,18 @@ def parse_event_dt_ff(e):
     return dt.replace(tzinfo=FF_TZ), True
 
 def build_weekly_digest(events, start_date_user, end_date_user, webhook):
+    """
+    Template B format, but with dates per-day:
+    MONDAY (Feb 17)
+    - 5:30 AM PT | CPI m/m
+    """
     rows = []
     for e in events:
         currency = (e.get("currency") or e.get("ccy") or "").strip().upper()
         if currency != "USD":
             continue
 
-        impact = e.get("impact")
-        if not is_high_impact(impact):
+        if not is_red_folder(e.get("impact")):
             continue
 
         title = (e.get("title") or e.get("event") or e.get("name") or "").strip()
@@ -146,57 +152,49 @@ def build_weekly_digest(events, start_date_user, end_date_user, webhook):
         dt_user = dt_ff.astimezone(USER_TZ)
         d_user = dt_user.date()
 
+        # Next 7 days window (works great with weekly schedule too)
         if not (start_date_user <= d_user < end_date_user):
             continue
 
-        t_txt = dt_user.strftime("%-I:%M %p PT") if time_known else "TBD"
-        rows.append((d_user, dt_user, t_txt, title, impact_label(impact)))
+        time_txt = dt_user.strftime("%-I:%M %p") if time_known else "TBD"
+        rows.append((d_user, dt_user, time_txt, title))
 
     # de-dupe and sort
     seen = set()
     uniq = []
-    for d_user, dt_user, t_txt, title, imp_lbl in rows:
-        key = (d_user.isoformat(), t_txt, title, imp_lbl)
+    for d_user, dt_user, time_txt, title in rows:
+        key = (d_user.isoformat(), time_txt, title)
         if key in seen:
             continue
         seen.add(key)
-        uniq.append((d_user, dt_user, t_txt, title, imp_lbl))
-
+        uniq.append((d_user, dt_user, time_txt, title))
     uniq.sort(key=lambda x: (x[0], x[1]))
 
-    start_day_name = start_date_user.strftime("%A")
-    end_day_name = (end_date_user - timedelta(days=1)).strftime("%A")
-
-    header = (
-        "@everyone\n"
-        "🇺🇸📅 **USD Red Folder — Weekly Digest**\n"
-        f"**{start_day_name} → {end_day_name} (PT)**\n"
-    )
+    header = "@everyone\n🔴 USD RED FOLDER THIS WEEK (PT)\n"
 
     if not uniq:
-        msg = header + "\n✅ No USD red-folder events found in the next 7 days."
-        discord_post(webhook, msg)
+        discord_post(webhook, header + "\n- No USD red-folder events found in the next 7 days.")
         return
 
     lines = [header]
     current_day = None
 
-    for d_user, _dt_user, t_txt, title, imp_lbl in uniq:
-        day_name = d_user.strftime("%A")
+    for d_user, _dt_user, time_txt, title in uniq:
         if current_day != d_user:
             current_day = d_user
-            lines.append(f"\n**{day_name}**")
-        # Now explicitly shows the “red folder name/label” + the event name (title)
-        lines.append(f"- {t_txt} — {imp_lbl} — **{title}**")
+            day_header = d_user.strftime("%A").upper()
+            date_label = d_user.strftime("%b %-d")  # e.g. Feb 17 (no year)
+            lines.append(f"\n{day_header} ({date_label})")
+        lines.append(f"- {time_txt} PT | {title}")
 
     msg = "\n".join(lines)
     if len(msg) > MAX_DISCORD_CHARS:
-        msg = msg[:MAX_DISCORD_CHARS] + "\n…(truncated) ✅"
+        msg = msg[:MAX_DISCORD_CHARS] + "\n…(truncated)"
 
     discord_post(webhook, msg)
 
 def main():
-    print("✅ ROOT SCRIPT RUNNING (weekly USD red-folder digest + label + @everyone)")
+    print("✅ ROOT SCRIPT RUNNING (Template B + per-day dates)")
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
