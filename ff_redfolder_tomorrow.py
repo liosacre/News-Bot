@@ -1,244 +1,279 @@
 import os
-import re
-from datetime import datetime, timedelta
+import json
+import textwrap
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
-
-OUT_TZ = ZoneInfo("America/New_York")  # New York / ET
-TARGET_CCY = "USD"
-RED_ONLY = True  # True = High only (red). False = High+Medium
-
-DISCORD_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"
-FF_JSON_ENV = "FF_JSON_URL"
+from dateutil import parser as dtparser
 
 
-# ---------------- Discord ----------------
-def discord_post(webhook_url: str, content: str) -> None:
-    # Split into <=2000 char chunks (Discord limit)
-    MAX = 2000
-    chunks = []
-    while content:
-        if len(content) <= MAX:
-            chunks.append(content)
-            break
-        cut = content.rfind("\n", 0, MAX)
-        if cut == -1:
-            cut = MAX
-        chunks.append(content[:cut])
-        content = content[cut:].lstrip("\n")
-
-    for ch in chunks:
-        r = requests.post(
-            webhook_url,
-            json={
-                "content": ch,
-                "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
+ET = ZoneInfo("America/New_York")
 
 
-# ---------------- ForexFactory JSON ----------------
-def fetch_ff_events(url: str) -> list[dict]:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+def _impact_label(v) -> str:
+    """Normalize impact to: high/medium/low/holiday/unknown."""
+    if v is None:
+        return "unknown"
+    s = str(v).strip().lower()
 
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for k in ("events", "data", "calendar", "rows", "items"):
-            v = data.get(k)
-            if isinstance(v, list):
-                return v
-    return []
+    # common strings
+    if s in ("high", "red", "3", "high impact", "highimpact"):
+        return "high"
+    if s in ("medium", "orange", "2", "medium impact", "mediumimpact"):
+        return "medium"
+    if s in ("low", "yellow", "1", "low impact", "lowimpact"):
+        return "low"
+    if "holiday" in s:
+        return "holiday"
+
+    # sometimes it's numeric but not stringified nicely
+    try:
+        n = int(float(s))
+        if n >= 3:
+            return "high"
+        if n == 2:
+            return "medium"
+        if n == 1:
+            return "low"
+    except Exception:
+        pass
+
+    return "unknown"
 
 
-def _as_str(x) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, (str, int, float, bool)):
-        return str(x)
-    if isinstance(x, dict):
-        # common nested shapes
-        for k in ("code", "value", "text", "name", "currency"):
-            if k in x:
-                return _as_str(x.get(k))
-        return ""
+def _get_currency(e: dict) -> str:
+    # ForexFactory exports vary; try a few keys
+    for k in ("currency", "ccy", "symbol"):
+        if k in e and e[k]:
+            return str(e[k]).strip().upper()
+    # sometimes it’s in "country"/"title" etc; we only want explicit USD
     return ""
 
 
-def get_currency(e: dict) -> str:
-    # handle many possible keys + nested dicts
-    for k in ("currency", "cur", "ccy", "currencyCode", "currency_code"):
-        if k in e:
-            s = _as_str(e.get(k)).strip().upper()
-            if s:
-                return s
-    # sometimes nested like e["country"]["currency"] etc.
-    for k in ("country", "meta"):
-        if isinstance(e.get(k), dict):
-            s = _as_str(e[k].get("currency")).strip().upper()
-            if s:
-                return s
-    return ""
-
-
-def get_impact(e: dict) -> str:
-    raw = (
-        e.get("impact")
-        or e.get("importance")
-        or e.get("volatility")
-        or e.get("impactTitle")
-        or e.get("impact_title")
-    )
-    s = _as_str(raw).strip().lower()
-
-    # numeric scales
-    if s in ("3", "high", "red") or "high" in s or "red" in s:
-        return "High"
-    if s in ("2", "medium", "orange") or "medium" in s or "orange" in s:
-        return "Medium"
-    if s in ("1", "low", "yellow") or "low" in s or "yellow" in s:
-        return "Low"
-    return "Unknown"
-
-
-def get_title(e: dict) -> str:
-    for k in ("title", "event", "name", "headline"):
-        s = _as_str(e.get(k)).strip()
-        if s:
-            return s
-    return "Unknown Event"
-
-
-def parse_dt_et(e: dict) -> datetime | None:
+def _parse_event_dt_et(e: dict) -> datetime | None:
     """
-    KEY FIX:
-    ForexFactory exports often include date + time strings that already match the calendar display.
-    We treat those as ET directly (America/New_York) to avoid the classic bug:
-    "UTC time mistakenly labeled as ET" (your 7:00 PM ET issue).
+    Best-effort parse of event datetime, returned in ET.
+    Handles:
+      - timestamp/ts/timeStamp seconds
+      - datetime/date+time strings
+      - date only ("all day"/"tentative") -> noon ET fallback
     """
-    date_str = _as_str(e.get("date") or e.get("day") or e.get("event_date")).strip()
-    time_str = _as_str(e.get("time") or e.get("event_time")).strip()
-
-    # date often looks like YYYY-MM-DD
-    if date_str:
-        # If time is like "2:00pm" / "2:00 pm" / "14:00"
-        if time_str and time_str.lower() not in ("all day", "tentative", "na", "n/a"):
-            t = time_str.lower().replace(" ", "")
-            # normalize "2:00pm"
-            m = re.match(r"^(\d{1,2}):(\d{2})(am|pm)$", t)
-            if m:
-                hh = int(m.group(1))
-                mm = int(m.group(2))
-                ap = m.group(3)
-                if ap == "pm" and hh != 12:
-                    hh += 12
-                if ap == "am" and hh == 12:
-                    hh = 0
-                try:
-                    d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=OUT_TZ)
-                except Exception:
-                    pass
-
-            # 24h fallback "14:00"
-            m2 = re.match(r"^(\d{1,2}):(\d{2})$", t)
-            if m2:
-                hh = int(m2.group(1))
-                mm = int(m2.group(2))
-                try:
-                    d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=OUT_TZ)
-                except Exception:
-                    pass
-
-        # if no time, set noon ET
+    # 1) timestamp fields (seconds)
+    for k in ("timestamp", "ts", "timeStamp", "time_stamp"):
+        v = e.get(k)
+        if v is None:
+            continue
         try:
-            d = datetime.strptime(date_str, "%Y-%m-%d").date()
-            return datetime(d.year, d.month, d.day, 12, 0, tzinfo=OUT_TZ)
+            # timestamp may be ms; detect
+            iv = int(str(v))
+            if iv > 10_000_000_000:  # ms
+                iv = iv // 1000
+            dt = datetime.fromtimestamp(iv, tz=timezone.utc).astimezone(ET)
+            return dt
         except Exception:
             pass
 
-    # last resort: timestamp epoch (assume UTC then convert)
-    for key in ("timestamp", "timeStamp", "ts", "date_timestamp", "event_timestamp"):
-        v = _as_str(e.get(key)).strip()
-        if v.isdigit():
-            n = int(v)
-            if n > 10_000_000_000:  # ms -> s
-                n //= 1000
-            dt_utc = datetime.fromtimestamp(n, tz=ZoneInfo("UTC"))
-            return dt_utc.astimezone(OUT_TZ)
+    # 2) combined datetime
+    for k in ("datetime", "dateTime", "date_time"):
+        if e.get(k):
+            try:
+                dt = dtparser.parse(str(e[k]))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=ET)
+                return dt.astimezone(ET)
+            except Exception:
+                pass
 
-    return None
+    # 3) date + time
+    date_str = e.get("date") or e.get("day") or e.get("eventDate") or ""
+    time_str = e.get("time") or e.get("eventTime") or ""
+
+    date_str = str(date_str).strip()
+    time_str = str(time_str).strip()
+
+    if not date_str:
+        return None
+
+    # if time is "All Day"/"Tentative"/blank -> set noon ET so it groups on the right day
+    if not time_str or time_str.lower() in ("all day", "tentative", "tbd"):
+        try:
+            d = dtparser.parse(date_str).date()
+            return datetime(d.year, d.month, d.day, 12, 0, tzinfo=ET)
+        except Exception:
+            return None
+
+    # Many FF exports show time like "11:00am" and date like "Feb 18"
+    # dtparser can handle "Feb 18 11:00am"
+    try:
+        dt = dtparser.parse(f"{date_str} {time_str}")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ET)
+        return dt.astimezone(ET)
+    except Exception:
+        # fallback: parse date only
+        try:
+            d = dtparser.parse(date_str).date()
+            return datetime(d.year, d.month, d.day, 12, 0, tzinfo=ET)
+        except Exception:
+            return None
 
 
-def build_message(events: list[dict]) -> str:
-    now = datetime.now(OUT_TZ)
-    end = now + timedelta(days=7)
+def fetch_events(ff_json_url: str) -> list[dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    r = requests.get(ff_json_url, headers=headers, timeout=30)
+    r.raise_for_status()
 
-    allowed = {"High"} if RED_ONLY else {"High", "Medium"}
+    ct = (r.headers.get("content-type") or "").lower()
+    text = r.text.strip()
 
-    picked = []
+    # If FF serves html/xml by mistake, fail loudly with a helpful snippet
+    if "json" not in ct:
+        # still might be JSON with wrong header; try parse
+        try:
+            return json.loads(text)
+        except Exception:
+            snippet = text[:300].replace("\n", " ")
+            raise RuntimeError(
+                f"FF_JSON_URL did not return JSON (content-type={ct}). "
+                f"First bytes: {snippet}"
+            )
+
+    try:
+        data = r.json()
+    except Exception as ex:
+        snippet = text[:300].replace("\n", " ")
+        raise RuntimeError(f"Could not parse JSON. First bytes: {snippet}") from ex
+
+    # Some exports wrap list in a dict
+    if isinstance(data, dict):
+        for k in ("events", "data", "calendar", "items"):
+            if isinstance(data.get(k), list):
+                return data[k]
+        # if dict but unknown
+        raise RuntimeError("Unexpected JSON shape (dict).")
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected JSON shape (not a list).")
+
+    return data
+
+
+def chunk_for_discord(s: str, limit: int = 1900) -> list[str]:
+    """
+    Split long message into <= limit chunks, preserving lines where possible.
+    """
+    lines = s.splitlines()
+    chunks = []
+    buf = []
+    size = 0
+
+    for line in lines:
+        add = len(line) + 1
+        if size + add > limit and buf:
+            chunks.append("\n".join(buf).rstrip())
+            buf = [line]
+            size = len(line) + 1
+        else:
+            buf.append(line)
+            size += add
+
+    if buf:
+        chunks.append("\n".join(buf).rstrip())
+    return chunks
+
+
+def discord_post(webhook: str, content: str) -> None:
+    payload = {
+        "content": content,
+        "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone
+    }
+    r = requests.post(webhook, json=payload, timeout=20)
+    r.raise_for_status()
+
+
+def build_weekly_digest(events: list[dict]) -> str:
+    now_et = datetime.now(ET)
+    week_start = (now_et - timedelta(days=now_et.weekday())).date()  # Monday
+    week_end = week_start + timedelta(days=6)  # Sunday
+
+    # Filter: USD + HIGH only (red folder)
+    filtered = []
     for e in events:
-        if get_currency(e) != TARGET_CCY:
+        ccy = _get_currency(e)
+        if ccy != "USD":
+            continue
+        impact = _impact_label(e.get("impact") or e.get("impactTitle") or e.get("impact_title"))
+        if impact != "high":
             continue
 
-        impact = get_impact(e)
-        if impact not in allowed:
+        dt_et = _parse_event_dt_et(e)
+        if dt_et is None:
             continue
 
-        dt = parse_dt_et(e)
-        if dt is None:
+        # Keep only events that fall within this calendar week in ET (Mon-Sun)
+        if not (week_start <= dt_et.date() <= week_end):
             continue
 
-        if not (now <= dt <= end):
-            continue
+        title = (e.get("title") or e.get("event") or e.get("name") or "Unknown Event").strip()
+        time_str_raw = str(e.get("time") or "").strip().lower()
+        is_tbd = (not time_str_raw) or (time_str_raw in ("all day", "tentative", "tbd"))
 
-        picked.append((dt, impact, get_title(e)))
+        filtered.append(
+            {
+                "dt": dt_et,
+                "title": title,
+                "tbd": is_tbd,
+            }
+        )
 
-    picked.sort(key=lambda x: x[0])
+    filtered.sort(key=lambda x: x["dt"])
 
-    header = "@everyone\n🔴 **USD RED FOLDER (HIGH IMPACT) — NEXT 7 DAYS (NEW YORK / ET)**\n"
+    header = [
+        "@everyone",
+        "🔴 **USD RED FOLDER — THIS WEEK (NEW YORK / ET)**",
+        f"Week of **{week_start.strftime('%b %d, %Y')}** → **{week_end.strftime('%b %d, %Y')}**",
+        "",
+    ]
 
-    if not picked:
-        return header + "\n• No USD RED folder (High impact) events found in the next 7 days."
+    if not filtered:
+        header.append("• No **USD high-impact (red folder)** events found in this week’s feed.")
+        return "\n".join(header).strip()
 
-    lines = [header]
-    current_date = None
+    # Group by day
+    out = header
+    cur_day = None
+    for item in filtered:
+        d = item["dt"].date()
+        if d != cur_day:
+            cur_day = d
+            out.append("")
+            out.append(f"**{item['dt'].strftime('%A').upper()} ({item['dt'].strftime('%b %d')})**")
+        if item["tbd"]:
+            out.append(f"• **TBD ET** | {item['title']}")
+        else:
+            out.append(f"• **{item['dt'].strftime('%-I:%M %p')} ET** | {item['title']}")
 
-    for dt, impact, title in picked:
-        if current_date != dt.date():
-            current_date = dt.date()
-            lines.append("")
-            lines.append(f"**{dt.strftime('%A').upper()} ( {dt.strftime('%b %-d')} )**")
-
-        lines.append(f"• **{dt.strftime('%-I:%M %p ET')}** | {title}")
-
-    return "\n".join(lines).strip()
+    return "\n".join(out).strip()
 
 
 def main():
-    webhook = os.environ.get(DISCORD_WEBHOOK_ENV, "").strip()
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    ff_json_url = os.environ.get("FF_JSON_URL", "").strip()
+
     if not webhook:
-        raise RuntimeError("Missing DISCORD_WEBHOOK_URL secret")
+        raise RuntimeError("Missing DISCORD_WEBHOOK_URL secret/env var.")
+    if not ff_json_url:
+        raise RuntimeError("Missing FF_JSON_URL secret/env var (your thisweek.json export link).")
 
-    ff_url = os.environ.get(FF_JSON_ENV, "").strip()
-    if not ff_url:
-        raise RuntimeError("Missing FF_JSON_URL secret (your thisweek.json export link)")
+    events = fetch_events(ff_json_url)
+    message = build_weekly_digest(events)
 
-    events = fetch_ff_events(ff_url)
-    msg = build_message(events)
-    discord_post(webhook, msg)
+    # Send (split if too long)
+    for chunk in chunk_for_discord(message):
+        discord_post(webhook, chunk)
 
 
 if __name__ == "__main__":
