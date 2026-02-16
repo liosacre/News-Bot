@@ -1,0 +1,25 @@
+name: FF Red Folder Tomorrow Alerts
+
+on:
+  schedule:
+    # Runs daily at 15:10 UTC (~7:10am PT / 10:10am ET)
+    - cron: "10 15 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests python-dateutil
+
+      - name: Run script
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python ff_redfolder_tomorrow.py
