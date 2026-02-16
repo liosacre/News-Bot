@@ -4,20 +4,21 @@ from datetime import datetime, timedelta, time
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
 
+# Use only THISWEEK (nextweek URL is 404 in your logs)
 FF_XML_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-FF_XML_NEXTWEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.xml"
 
-FF_TZ = tz.gettz("America/Chicago")
-USER_TZ = tz.gettz("America/Los_Angeles")
+FF_TZ = tz.gettz("America/Chicago")          # ForexFactory feed timezone (commonly Chicago)
+USER_TZ = tz.gettz("America/Los_Angeles")    # PT display
 
 MAX_DISCORD_CHARS = 1800
 
-# True = include Medium(🟠) + High(🔴). False = High(🔴) only
+# True = include Medium + High. False = High only
 INCLUDE_MEDIUM = True
 
 def discord_post(webhook_url: str, content: str) -> None:
     payload = {
         "content": content,
+        # allow @everyone to work
         "allowed_mentions": {"parse": ["everyone"]},
     }
     r = requests.post(webhook_url, json=payload, timeout=20)
@@ -74,6 +75,7 @@ def parse_dt_ff(e):
     if not date_str:
         raise ValueError("missing date")
 
+    # If time is missing/tentative, treat as TBD
     if not time_str or time_str.lower() in ("all day", "tentative", "tbd"):
         d = parser.parse(date_str).date()
         return datetime.combine(d, time(0, 0)).replace(tzinfo=FF_TZ), False
@@ -81,31 +83,28 @@ def parse_dt_ff(e):
     dt = parser.parse(f"{date_str} {time_str}")
     return dt.replace(tzinfo=FF_TZ), True
 
-def build_template_b_message(events):
-    # We format a fixed Template B message no matter what happens
+def build_template_b(events):
     lines = []
     lines.append("@everyone")
     lines.append("🔴 **USD IMPORTANT NEWS THIS WEEK (PT)**")
     lines.append("")  # spacer
 
-    # Window: next 7 days in PT (you can change to full week if you want)
     start_pt = datetime.now(USER_TZ).date()
     end_pt = start_pt + timedelta(days=7)
 
     rows = []
-    usd_total = 0
+    usd_any = 0
+    usd_hm = 0
 
     for e in events:
         ccy = (e.get("currency") or "").strip().upper()
         title = (e.get("title") or "").strip()
-        if not title:
-            continue
 
         if ccy == "USD":
-            usd_total += 1
+            usd_any += 1
 
-        # Filter USD only
-        if ccy != "USD":
+        # USD only
+        if ccy != "USD" or not title:
             continue
 
         level, emoji = impact_level_emoji(e.get("impact") or "")
@@ -122,15 +121,17 @@ def build_template_b_message(events):
         dt_pt = dt_ff.astimezone(USER_TZ)
         d_pt = dt_pt.date()
 
-        # keep only next 7 days
+        # Only next 7 days
         if not (start_pt <= d_pt < end_pt):
             continue
 
         t_txt = dt_pt.strftime("%-I:%M %p") if time_known else "TBD"
         rows.append((d_pt, dt_pt, t_txt, emoji, title))
+        usd_hm += 1
 
-    # Sort + dedupe
     rows.sort(key=lambda x: (x[0], x[1]))
+
+    # Dedupe identical lines
     dedup = []
     seen = set()
     for d_pt, dt_pt, t_txt, emoji, title in rows:
@@ -141,19 +142,19 @@ def build_template_b_message(events):
         dedup.append((d_pt, t_txt, emoji, title))
 
     if not dedup:
-        # ✅ STILL in Template B format
         lines.append("• ✅ No USD high/medium events found in the next 7 days.")
-        # Debug ONLY in GitHub logs (not Discord)
-        print(f"DEBUG: USD events found in feed (any impact): {usd_total}")
     else:
         current_day = None
         for d_pt, t_txt, emoji, title in dedup:
             if current_day != d_pt:
                 current_day = d_pt
-                # ✅ Day + readable date (what you asked)
                 lines.append("")
+                # Example: WEDNESDAY (Feb 18)
                 lines.append(f"**{d_pt.strftime('%A').upper()} ({d_pt.strftime('%b %-d')})**")
             lines.append(f"• {t_txt} PT | {emoji} {title}")
+
+    # Debug goes to Actions logs only (not Discord)
+    print(f"DEBUG: USD in feed(any impact)={usd_any} | USD high/med in next7days={usd_hm}")
 
     msg = "\n".join(lines)
     if len(msg) > MAX_DISCORD_CHARS:
@@ -165,12 +166,10 @@ def main():
     if not webhook:
         raise SystemExit("Missing DISCORD_WEBHOOK_URL secret/env var")
 
-    # Pull both feeds (some weeks spill)
-    xml1 = fetch_xml(FF_XML_THISWEEK)
-    xml2 = fetch_xml(FF_XML_NEXTWEEK)
-    events = parse_events_from_xml(xml1) + parse_events_from_xml(xml2)
+    xml_text = fetch_xml(FF_XML_THISWEEK)
+    events = parse_events_from_xml(xml_text)
 
-    msg = build_template_b_message(events)
+    msg = build_template_b(events)
     discord_post(webhook, msg)
 
 if __name__ == "__main__":
