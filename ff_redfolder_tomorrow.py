@@ -7,20 +7,30 @@ import xml.etree.ElementTree as ET
 # ---- FEEDS ----
 FF_JSON_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json?version=022d9054928114f2c2f2b2cadd3e8066"
 FF_JSON_NEXTWEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
-
 FF_XML_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 FF_XML_NEXTWEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.xml"
 
 # ---- TIMEZONES ----
-FF_TZ = tz.gettz("America/Chicago")        # FF feed commonly aligns to Chicago time
-USER_TZ = tz.gettz("America/Los_Angeles")  # output in PT
+FF_TZ = tz.gettz("America/Chicago")
+USER_TZ = tz.gettz("America/Los_Angeles")
 
 MAX_DISCORD_CHARS = 1900
+
+def pick(e, *keys):
+    """Return first non-empty field from a dict for the given keys."""
+    for k in keys:
+        v = e.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s != "":
+            return v
+    return None
 
 def discord_post(webhook_url: str, content: str) -> None:
     payload = {
         "content": content,
-        "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone ping (if server permits)
+        "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone ping (if permitted)
     }
     r = requests.post(webhook_url, json=payload, timeout=20)
     r.raise_for_status()
@@ -69,6 +79,7 @@ def fetch_events_from_xml(url: str):
         print("XML parse failed:", e)
         print("BODY PREVIEW:", r.text[:160])
         return []
+
     events = []
     for ev in root.findall(".//event"):
         def get(tag):
@@ -92,28 +103,30 @@ def get_feed_events(json_url: str, xml_url: str):
     return fetch_events_from_xml(xml_url)
 
 def is_red_folder(impact) -> bool:
-    """
-    ForexFactory exports aren't always consistent.
-    We treat these as red-folder/high impact:
-    - contains 'high' or 'red'
-    - equals '3'
-    - contains 'highimpact'
-    """
     s = str(impact or "").strip().lower()
-    if s == "3":
-        return True
-    return ("high" in s) or ("red" in s) or ("highimpact" in s)
+
+    # numeric impact levels (some exports)
+    if s.isdigit():
+        return int(s) >= 3
+
+    # text variants
+    return ("high" in s) or ("red" in s)
 
 def parse_event_dt_ff(e):
     """
     Return (dt_ff, time_known_bool) in FF_TZ.
+    Handles timestamp in seconds OR milliseconds.
     """
-    ts = e.get("timestamp") or e.get("ts") or e.get("timeStamp")
+    ts = pick(e, "timestamp", "ts", "timeStamp", "time_stamp", "timeUnix", "unix", "epoch")
     if ts is not None and str(ts).strip().isdigit():
-        return datetime.fromtimestamp(int(str(ts).strip()), tz=FF_TZ), True
+        n = int(str(ts).strip())
+        # milliseconds guard: 13 digits usually
+        if n > 10_000_000_000:  # > ~ year 2286 in seconds -> treat as ms
+            n = n // 1000
+        return datetime.fromtimestamp(n, tz=FF_TZ), True
 
-    date_str = (e.get("date") or e.get("day") or "").strip()
-    time_str = (e.get("time") or e.get("datetime") or "").strip()
+    date_str = str(pick(e, "date", "day", "eventDate", "event_date") or "").strip()
+    time_str = str(pick(e, "time", "datetime", "eventTime", "event_time") or "").strip()
 
     if not date_str:
         raise ValueError("missing date")
@@ -125,22 +138,22 @@ def parse_event_dt_ff(e):
     dt = parser.parse(f"{date_str} {time_str}")
     return dt.replace(tzinfo=FF_TZ), True
 
-def build_weekly_digest(events, start_date_user, end_date_user, webhook):
-    """
-    Template B format, but with dates per-day:
-    MONDAY (Feb 17)
-    - 5:30 AM PT | CPI m/m
-    """
+def build_digest_template_b(events, start_date_pt, end_date_pt, webhook):
+    # Template B + date per day header (no confusing range line)
+    header = "@everyone\n🔴 USD RED FOLDER THIS WEEK (PT)\n"
+
     rows = []
+
     for e in events:
-        currency = (e.get("currency") or e.get("ccy") or "").strip().upper()
+        currency = str(pick(e, "currency", "ccy", "Currency") or "").strip().upper()
+        impact = pick(e, "impact", "Impact", "impactTitle", "impact_title", "impactId", "impact_id", "importance")
+
+        title = str(pick(e, "title", "event", "name", "eventName", "event_name") or "").strip()
+
         if currency != "USD":
             continue
-
-        if not is_red_folder(e.get("impact")):
+        if not is_red_folder(impact):
             continue
-
-        title = (e.get("title") or e.get("event") or e.get("name") or "").strip()
         if not title:
             continue
 
@@ -149,43 +162,51 @@ def build_weekly_digest(events, start_date_user, end_date_user, webhook):
         except Exception:
             continue
 
-        dt_user = dt_ff.astimezone(USER_TZ)
-        d_user = dt_user.date()
+        dt_pt = dt_ff.astimezone(USER_TZ)
+        d_pt = dt_pt.date()
 
-        # Next 7 days window (works great with weekly schedule too)
-        if not (start_date_user <= d_user < end_date_user):
+        if not (start_date_pt <= d_pt < end_date_pt):
             continue
 
-        time_txt = dt_user.strftime("%-I:%M %p") if time_known else "TBD"
-        rows.append((d_user, dt_user, time_txt, title))
+        t_txt = dt_pt.strftime("%-I:%M %p") if time_known else "TBD"
+        rows.append((d_pt, dt_pt, t_txt, title))
 
-    # de-dupe and sort
+    # Dedup + sort
     seen = set()
     uniq = []
-    for d_user, dt_user, time_txt, title in rows:
-        key = (d_user.isoformat(), time_txt, title)
+    for d_pt, dt_pt, t_txt, title in rows:
+        key = (d_pt.isoformat(), t_txt, title)
         if key in seen:
             continue
         seen.add(key)
-        uniq.append((d_user, dt_user, time_txt, title))
+        uniq.append((d_pt, dt_pt, t_txt, title))
+
     uniq.sort(key=lambda x: (x[0], x[1]))
 
-    header = "@everyone\n🔴 USD RED FOLDER THIS WEEK (PT)\n"
-
     if not uniq:
-        discord_post(webhook, header + "\n- No USD red-folder events found in the next 7 days.")
+        # Debug info (so we can see what the feed contains)
+        sample = []
+        for e in (events or [])[:8]:
+            c = str(pick(e, "currency", "ccy") or "")
+            imp = str(pick(e, "impact", "impactTitle", "impactId") or "")
+            nm = str(pick(e, "title", "event", "name") or "")
+            sample.append(f"{c}|{imp}|{nm}"[:80])
+
+        msg = header + "\n- No USD red-folder events found in the next 7 days.\n"
+        msg += f"\n(debug: fetched {len(events or [])} events; sample: {', '.join(sample)})"
+        discord_post(webhook, msg)
         return
 
     lines = [header]
     current_day = None
 
-    for d_user, _dt_user, time_txt, title in uniq:
-        if current_day != d_user:
-            current_day = d_user
-            day_header = d_user.strftime("%A").upper()
-            date_label = d_user.strftime("%b %-d")  # e.g. Feb 17 (no year)
+    for d_pt, _dt_pt, t_txt, title in uniq:
+        if current_day != d_pt:
+            current_day = d_pt
+            day_header = d_pt.strftime("%A").upper()
+            date_label = d_pt.strftime("%b %-d")  # e.g. Feb 18
             lines.append(f"\n{day_header} ({date_label})")
-        lines.append(f"- {time_txt} PT | {title}")
+        lines.append(f"- {t_txt} PT | {title}")
 
     msg = "\n".join(lines)
     if len(msg) > MAX_DISCORD_CHARS:
@@ -194,21 +215,18 @@ def build_weekly_digest(events, start_date_user, end_date_user, webhook):
     discord_post(webhook, msg)
 
 def main():
-    print("✅ ROOT SCRIPT RUNNING (Template B + per-day dates)")
-
     webhook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
         raise SystemExit("Missing DISCORD_WEBHOOK_URL secret/env var")
 
-    start_user = datetime.now(USER_TZ).date()
-    end_user = start_user + timedelta(days=7)
+    start_pt = datetime.now(USER_TZ).date()
+    end_pt = start_pt + timedelta(days=7)
 
     events_this = get_feed_events(FF_JSON_THISWEEK, FF_XML_THISWEEK)
     events_next = get_feed_events(FF_JSON_NEXTWEEK, FF_XML_NEXTWEEK)
     all_events = (events_this or []) + (events_next or [])
 
-    build_weekly_digest(all_events, start_user, end_user, webhook)
-    print("Done.")
+    build_digest_template_b(all_events, start_pt, end_pt, webhook)
 
 if __name__ == "__main__":
     main()
