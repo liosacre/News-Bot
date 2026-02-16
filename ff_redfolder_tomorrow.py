@@ -22,6 +22,7 @@ def fetch_json(url: str):
     }
     r = requests.get(url, headers=headers, timeout=30)
 
+    # Helpful debug in Actions logs (won't expose your webhook)
     ct = r.headers.get("content-type", "")
     print(f"FETCH -> {r.status_code} {ct}")
 
@@ -30,6 +31,7 @@ def fetch_json(url: str):
         return {}
 
     if "json" not in ct.lower():
+        # Sometimes a blocked/HTML page comes back
         print("NOT JSON. BODY PREVIEW:", r.text[:200])
         return {}
 
@@ -52,14 +54,17 @@ def as_events(payload):
 
 def is_high_impact(impact) -> bool:
     s = str(impact or "").strip().lower()
+    # Common encodings across exports
     return s in ("high", "red", "high impact", "3", "highimpact")
 
 def parse_event_dt(e) -> datetime:
+    # Timestamp fields (seconds) if present
     for k in ("timestamp", "ts", "timeStamp"):
         v = e.get(k)
         if v is not None and str(v).isdigit():
             return datetime.fromtimestamp(int(v), tz=FF_TZ)
 
+    # Fallback: "date" + "time"
     date_str = e.get("date") or e.get("day") or ""
     time_str = e.get("time") or e.get("datetime") or ""
 
@@ -76,6 +81,7 @@ def main():
     if not webhook:
         raise SystemExit("Missing DISCORD_WEBHOOK_URL secret/env var")
 
+    # "1 day before" = events happening tomorrow in your timezone
     now_user = datetime.now(USER_TZ)
     tomorrow = (now_user + timedelta(days=1)).date()
 
@@ -84,12 +90,12 @@ def main():
 
     hits = []
     for e in events:
-        # ✅ USD ONLY filter
+        # ✅ USD ONLY
         currency = (e.get("currency") or e.get("ccy") or "").strip().upper()
         if currency != "USD":
             continue
 
-        # ✅ High impact only (red folder)
+        # ✅ Red folder / high impact only
         if not is_high_impact(e.get("impact")):
             continue
 
