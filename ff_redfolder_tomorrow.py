@@ -1,13 +1,13 @@
 import os
 import requests
-from datetime import datetime, time
+from datetime import datetime
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
 
 FF_XML_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 
-UTC = tz.gettz("UTC")
-ET = tz.gettz("America/New_York")
+UTC_TZ = tz.gettz("UTC")
+NY_TZ = tz.gettz("America/New_York")
 
 MAX_DISCORD_CHARS = 1800
 
@@ -18,7 +18,7 @@ INCLUDE_MEDIUM = False
 def discord_post(webhook_url: str, content: str) -> None:
     payload = {
         "content": content,
-        "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone ping (if server permits)
+        "allowed_mentions": {"parse": ["everyone"]},
     }
     r = requests.post(webhook_url, json=payload, timeout=20)
     r.raise_for_status()
@@ -40,9 +40,6 @@ def get_text(node: ET.Element, tag: str) -> str:
 
 
 def impact_level(impact_raw: str) -> str:
-    """
-    Returns: 'high', 'medium', 'low'
-    """
     s = (impact_raw or "").strip().lower()
     if "high" in s or "red" in s:
         return "high"
@@ -57,20 +54,18 @@ def impact_level(impact_raw: str) -> str:
     return "low"
 
 
-def parse_event_datetime_et(ev: dict):
+def parse_event_datetime_ny(ev: dict):
     """
-    Returns (dt_et, time_known_bool)
-    - Prefer Unix timestamp (most accurate).
-    - If no timestamp, parse date+time and assume it's ET.
+    Returns (dt_ny, time_known_bool)
+    Prefer Unix timestamp (UTC) then convert -> NY time.
     """
     ts = (ev.get("timestamp") or "").strip()
     if ts.isdigit():
         n = int(ts)
-        # ms guard
-        if n > 10_000_000_000:
+        if n > 10_000_000_000:  # ms guard
             n //= 1000
-        dt_utc = datetime.fromtimestamp(n, tz=UTC)
-        return dt_utc.astimezone(ET), True
+        dt_utc = datetime.fromtimestamp(n, tz=UTC_TZ)
+        return dt_utc.astimezone(NY_TZ), True
 
     date_str = (ev.get("date") or "").strip()
     time_str = (ev.get("time") or "").strip()
@@ -80,15 +75,15 @@ def parse_event_datetime_et(ev: dict):
 
     if not time_str or time_str.lower() in ("all day", "tentative", "tbd"):
         d = parser.parse(date_str).date()
-        dt_et = datetime(d.year, d.month, d.day, 0, 0, tzinfo=ET)
-        return dt_et, False
+        dt_ny = datetime(d.year, d.month, d.day, 0, 0, tzinfo=NY_TZ)
+        return dt_ny, False
 
     dt = parser.parse(f"{date_str} {time_str}")
-    # Assume ET if timezone missing
+    # If timezone missing, assume NY time
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ET)
+        dt = dt.replace(tzinfo=NY_TZ)
     else:
-        dt = dt.astimezone(ET)
+        dt = dt.astimezone(NY_TZ)
     return dt, True
 
 
@@ -96,7 +91,7 @@ def parse_events(xml_text: str):
     root = ET.fromstring(xml_text)
     events = []
     for node in root.findall(".//event"):
-        # ForexFactory commonly uses <country>USD</country> for currency
+        # ForexFactory often uses <country>USD</country>
         country = get_text(node, "country")
         currency = get_text(node, "currency")
 
@@ -112,15 +107,15 @@ def parse_events(xml_text: str):
 
 
 def build_template_b_message(events):
-    # Template B (ET)
     lines = []
     lines.append("@everyone")
-    lines.append("🔴 USD RED FOLDER THIS WEEK (ET)")
+    lines.append("🔴 USD RED FOLDER THIS WEEK (NEW YORK / ET)")
     lines.append("")
 
     rows = []
     usd_any = 0
     usd_high = 0
+    usd_medium = 0
 
     for ev in events:
         if ev["ccy"] == "USD":
@@ -140,40 +135,45 @@ def build_template_b_message(events):
             continue
 
         try:
-            dt_et, time_known = parse_event_datetime_et(ev)
+            dt_ny, time_known = parse_event_datetime_ny(ev)
         except Exception:
             continue
 
-        t_txt = dt_et.strftime("%-I:%M %p") if time_known else "TBD"
-        rows.append((dt_et, t_txt, title, lvl))
+        t_txt = dt_ny.strftime("%-I:%M %p") if time_known else "TBD"
+        rows.append((dt_ny, t_txt, title, lvl))
+
         if lvl == "high":
             usd_high += 1
+        elif lvl == "medium":
+            usd_medium += 1
 
-    # Sort + dedupe
     rows.sort(key=lambda x: x[0])
+
+    # Dedup
     seen = set()
     dedup = []
-    for dt_et, t_txt, title, lvl in rows:
-        key = (dt_et.date().isoformat(), t_txt, title, lvl)
+    for dt_ny, t_txt, title, lvl in rows:
+        key = (dt_ny.date().isoformat(), t_txt, title, lvl)
         if key in seen:
             continue
         seen.add(key)
-        dedup.append((dt_et, t_txt, title, lvl))
+        dedup.append((dt_ny, t_txt, title, lvl))
 
     if not dedup:
         lines.append("- No USD red-folder (HIGH) events found in THISWEEK feed.")
     else:
         current_day = None
-        for dt_et, t_txt, title, _lvl in dedup:
-            if current_day != dt_et.date():
-                current_day = dt_et.date()
-                # e.g. WEDNESDAY (Feb 19)
+        for dt_ny, t_txt, title, _lvl in dedup:
+            if current_day != dt_ny.date():
+                current_day = dt_ny.date()
                 lines.append("")
-                lines.append(f"{dt_et.strftime('%A').upper()} ({dt_et.strftime('%b %-d')})")
+                lines.append(f"{dt_ny.strftime('%A').upper()} ({dt_ny.strftime('%b %-d')})")
             lines.append(f"- {t_txt} ET | {title}")
 
-    # Debug to Actions logs only (helps verify you’re reading USD correctly)
-    print(f"DEBUG: parsed_events={len(events)} | usd_any={usd_any} | usd_high={usd_high}")
+    # Shows in GitHub Actions logs so you can confirm it’s reading USD & impacts
+    print(
+        f"DEBUG: parsed_events={len(events)} | usd_any={usd_any} | usd_high={usd_high} | usd_medium={usd_medium}"
+    )
 
     msg = "\n".join(lines).strip()
     if len(msg) > MAX_DISCORD_CHARS:
