@@ -1,71 +1,111 @@
 import os
 import requests
-from datetime import datetime, timedelta, time
+from datetime import datetime
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
 
-# Use only THISWEEK (nextweek URL is 404 in your logs)
 FF_XML_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 
-FF_TZ = tz.gettz("America/Chicago")          # ForexFactory feed timezone (commonly Chicago)
-USER_TZ = tz.gettz("America/Los_Angeles")    # PT display
+# Feed is commonly Chicago time; we display in PT
+FF_TZ = tz.gettz("America/Chicago")
+PT_TZ = tz.gettz("America/Los_Angeles")
 
 MAX_DISCORD_CHARS = 1800
 
-# True = include Medium + High. False = High only
-INCLUDE_MEDIUM = True
 
 def discord_post(webhook_url: str, content: str) -> None:
-    payload = {
-        "content": content,
-        # allow @everyone to work
-        "allowed_mentions": {"parse": ["everyone"]},
-    }
-    r = requests.post(webhook_url, json=payload, timeout=20)
+    r = requests.post(
+        webhook_url,
+        json={
+            "content": content,
+            "allowed_mentions": {"parse": ["everyone"]},  # allow @everyone
+        },
+        timeout=20,
+    )
     r.raise_for_status()
 
-def fetch_xml(url: str) -> str:
+
+def fetch_text(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/xml,text/xml,*/*"}
     r = requests.get(url, headers=headers, timeout=30)
     print(f"GET {url} -> {r.status_code} {r.headers.get('content-type','')}")
     r.raise_for_status()
     return r.text
 
-def parse_events_from_xml(xml_text: str):
-    root = ET.fromstring(xml_text)
-    events = []
-    for ev in root.findall(".//event"):
-        def get(tag):
-            node = ev.find(tag)
-            return (node.text or "").strip() if node is not None else ""
 
-        events.append({
-            "date": get("date"),
-            "time": get("time"),
-            "currency": get("currency"),
-            "impact": get("impact"),
-            "title": get("title") or get("event") or get("name"),
-            "timestamp": get("timestamp") or get("ts") or get("timeStamp"),
-        })
+def _get_text_or_attr(node: ET.Element, candidates):
+    """
+    Read a value from:
+    - child tag text (e.g. <currency>USD</currency>)
+    - OR attribute (e.g. <event currency="USD">)
+    Returns '' if not found.
+    """
+    # Try tags first
+    for key in candidates:
+        child = node.find(key)
+        if child is not None and child.text:
+            val = child.text.strip()
+            if val:
+                return val
+
+    # Then try attributes
+    for key in candidates:
+        val = (node.attrib.get(key) or "").strip()
+        if val:
+            return val
+
+    return ""
+
+
+def parse_events(xml_text: str):
+    root = ET.fromstring(xml_text)
+
+    # Works for both namespaced and non-namespaced XML
+    events = []
+    for ev in root.iter():
+        tag = ev.tag.lower()
+        if tag.endswith("event"):
+            # currency sometimes appears as <currency> or <country> or attribute
+            currency = _get_text_or_attr(ev, ["currency", "country", "ccy"])
+            impact = _get_text_or_attr(ev, ["impact", "importance"])
+            title = _get_text_or_attr(ev, ["title", "event", "name"])
+            date_str = _get_text_or_attr(ev, ["date", "day"])
+            time_str = _get_text_or_attr(ev, ["time", "datetime"])
+            timestamp = _get_text_or_attr(ev, ["timestamp", "ts", "timeStamp"])
+
+            events.append(
+                {
+                    "currency": currency,
+                    "impact": impact,
+                    "title": title,
+                    "date": date_str,
+                    "time": time_str,
+                    "timestamp": timestamp,
+                }
+            )
+
     return events
 
-def impact_level_emoji(impact_raw: str):
-    s = (impact_raw or "").strip().lower()
-    if "high" in s or "red" in s:
-        return "high", "🔴"
-    if "medium" in s or "med" in s or "orange" in s:
-        return "medium", "🟠"
-    if s.isdigit():
-        n = int(s)
-        if n >= 3: return "high", "🔴"
-        if n == 2: return "medium", "🟠"
-    return "low", "🟡"
 
-def parse_dt_ff(e):
+def impact_is_red(impact_raw: str) -> bool:
+    s = (impact_raw or "").strip().lower()
+    # ForexFactory feeds vary: "High", "high", "3", "red"
+    if "high" in s or "red" in s:
+        return True
+    if s.isdigit() and int(s) >= 3:
+        return True
+    return False
+
+
+def parse_event_dt(e):
+    """
+    Returns (dt_ff, time_known)
+    dt_ff is timezone-aware in FF_TZ
+    """
     ts = (e.get("timestamp") or "").strip()
     if ts.isdigit():
         n = int(ts)
-        if n > 10_000_000_000:
+        if n > 10_000_000_000:  # milliseconds -> seconds
             n //= 1000
         return datetime.fromtimestamp(n, tz=FF_TZ), True
 
@@ -75,102 +115,83 @@ def parse_dt_ff(e):
     if not date_str:
         raise ValueError("missing date")
 
-    # If time is missing/tentative, treat as TBD
+    # Some feeds use "Tentative", "All Day", or blank
     if not time_str or time_str.lower() in ("all day", "tentative", "tbd"):
         d = parser.parse(date_str).date()
-        return datetime.combine(d, time(0, 0)).replace(tzinfo=FF_TZ), False
+        dt = datetime(d.year, d.month, d.day, 0, 0, tzinfo=FF_TZ)
+        return dt, False
 
     dt = parser.parse(f"{date_str} {time_str}")
-    return dt.replace(tzinfo=FF_TZ), True
+    # If parser returns naive, attach feed tz
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=FF_TZ)
+    return dt, True
 
-def build_template_b(events):
-    lines = []
-    lines.append("@everyone")
-    lines.append("🔴 **USD IMPORTANT NEWS THIS WEEK (PT)**")
-    lines.append("")  # spacer
 
-    start_pt = datetime.now(USER_TZ).date()
-    end_pt = start_pt + timedelta(days=7)
-
-    rows = []
-    usd_any = 0
-    usd_hm = 0
-
+def build_message(events):
+    # Filter: USD + RED only + has title
+    filtered = []
     for e in events:
         ccy = (e.get("currency") or "").strip().upper()
         title = (e.get("title") or "").strip()
-
-        if ccy == "USD":
-            usd_any += 1
-
-        # USD only
-        if ccy != "USD" or not title:
+        if ccy != "USD":
             continue
-
-        level, emoji = impact_level_emoji(e.get("impact") or "")
-        if level == "low":
+        if not title:
             continue
-        if level == "medium" and not INCLUDE_MEDIUM:
+        if not impact_is_red(e.get("impact") or ""):
             continue
 
         try:
-            dt_ff, time_known = parse_dt_ff(e)
+            dt_ff, time_known = parse_event_dt(e)
         except Exception:
             continue
 
-        dt_pt = dt_ff.astimezone(USER_TZ)
-        d_pt = dt_pt.date()
+        dt_pt = dt_ff.astimezone(PT_TZ)
+        filtered.append((dt_pt, time_known, title))
 
-        # Only next 7 days
-        if not (start_pt <= d_pt < end_pt):
-            continue
+    filtered.sort(key=lambda x: x[0])
 
-        t_txt = dt_pt.strftime("%-I:%M %p") if time_known else "TBD"
-        rows.append((d_pt, dt_pt, t_txt, emoji, title))
-        usd_hm += 1
+    lines = []
+    lines.append("@everyone")
+    lines.append("🔴 **USD RED FOLDER EVENTS THIS WEEK (PT)**")
+    lines.append("")
 
-    rows.sort(key=lambda x: (x[0], x[1]))
-
-    # Dedupe identical lines
-    dedup = []
-    seen = set()
-    for d_pt, dt_pt, t_txt, emoji, title in rows:
-        key = (d_pt.isoformat(), t_txt, emoji, title)
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append((d_pt, t_txt, emoji, title))
-
-    if not dedup:
-        lines.append("• ✅ No USD high/medium events found in the next 7 days.")
+    if not filtered:
+        lines.append("• ✅ No USD red-folder (High impact) events found in the THISWEEK feed.")
     else:
         current_day = None
-        for d_pt, t_txt, emoji, title in dedup:
-            if current_day != d_pt:
-                current_day = d_pt
-                lines.append("")
-                # Example: WEDNESDAY (Feb 18)
-                lines.append(f"**{d_pt.strftime('%A').upper()} ({d_pt.strftime('%b %-d')})**")
-            lines.append(f"• {t_txt} PT | {emoji} {title}")
+        for dt_pt, time_known, title in filtered:
+            day_key = dt_pt.date()
+            if current_day != day_key:
+                current_day = day_key
+                # Example: WEDNESDAY, Feb 18
+                lines.append(f"**{dt_pt.strftime('%A').upper()}, {dt_pt.strftime('%b %-d')}**")
+            t_txt = dt_pt.strftime("%-I:%M %p") if time_known else "TBD"
+            lines.append(f"• {t_txt} PT — {title}")
+            lines.append("")
 
-    # Debug goes to Actions logs only (not Discord)
-    print(f"DEBUG: USD in feed(any impact)={usd_any} | USD high/med in next7days={usd_hm}")
-
-    msg = "\n".join(lines)
+    msg = "\n".join(lines).strip()
     if len(msg) > MAX_DISCORD_CHARS:
         msg = msg[:MAX_DISCORD_CHARS] + "\n…(truncated)"
     return msg
+
 
 def main():
     webhook = os.environ.get("DISCORD_WEBHOOK_URL")
     if not webhook:
         raise SystemExit("Missing DISCORD_WEBHOOK_URL secret/env var")
 
-    xml_text = fetch_xml(FF_XML_THISWEEK)
-    events = parse_events_from_xml(xml_text)
+    xml_text = fetch_text(FF_XML_THISWEEK)
+    events = parse_events(xml_text)
 
-    msg = build_template_b(events)
+    # Useful debug in Actions logs (NOT Discord)
+    usd_any = sum(1 for e in events if (e.get("currency") or "").strip().upper() == "USD")
+    red_any = sum(1 for e in events if impact_is_red(e.get("impact") or ""))
+    print(f"DEBUG: parsed_events={len(events)} | usd_any={usd_any} | red_any={red_any}")
+
+    msg = build_message(events)
     discord_post(webhook, msg)
+
 
 if __name__ == "__main__":
     main()
