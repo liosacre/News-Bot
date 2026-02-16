@@ -1,195 +1,211 @@
 import os
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
 import requests
-from datetime import datetime
-from dateutil import parser, tz
-import xml.etree.ElementTree as ET
 
-FF_XML_THISWEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+# =========================
+# SETTINGS (edit these)
+# =========================
 
-UTC_TZ = tz.gettz("UTC")
-NY_TZ = tz.gettz("America/New_York")
+# Put your ForexFactory JSON export URL in GitHub Secret named FF_JSON_URL (recommended).
+# If you don't, it will fall back to this default value below.
+DEFAULT_FF_JSON_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-MAX_DISCORD_CHARS = 1800
+# Discord webhook comes from GitHub Secret: DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_ENV = "DISCORD_WEBHOOK_URL"
 
-# False = HIGH only (true red folder). True = include MEDIUM too.
-INCLUDE_MEDIUM = False
+# Output timezone: New York time
+OUT_TZ = ZoneInfo("America/New_York")
 
+# Filters
+TARGET_CURRENCY = "USD"
+ALLOWED_IMPACTS = {"High", "Medium"}   # set to {"High"} if you want ONLY red folders
+
+
+# =========================
+# DISCORD
+# =========================
 
 def discord_post(webhook_url: str, content: str) -> None:
-    payload = {
-        "content": content,
-        "allowed_mentions": {"parse": ["everyone"]},
+    # Discord hard limit is 2000 chars per message
+    MAX = 2000
+    chunks = []
+    while content:
+        if len(content) <= MAX:
+            chunks.append(content)
+            break
+        cut = content.rfind("\n", 0, MAX)
+        if cut == -1:
+            cut = MAX
+        chunks.append(content[:cut])
+        content = content[cut:].lstrip("\n")
+
+    for ch in chunks:
+        r = requests.post(webhook_url, json={"content": ch}, timeout=20)
+        r.raise_for_status()
+
+
+# =========================
+# FOREXFACTORY PARSING
+# =========================
+
+def fetch_ff_json(url: str) -> list[dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
-    r = requests.post(webhook_url, json=payload, timeout=20)
-    r.raise_for_status()
-
-
-def fetch_xml(url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/xml,text/xml,*/*"}
     r = requests.get(url, headers=headers, timeout=30)
-    print(f"GET {url} -> {r.status_code} {r.headers.get('content-type','')}")
     r.raise_for_status()
-    return r.text
+
+    # Sometimes servers return HTML even with 200; guard it
+    ctype = (r.headers.get("content-type") or "").lower()
+    if "json" not in ctype:
+        # still try, but fail loudly if not json
+        pass
+
+    data = r.json()
+
+    # Common shapes:
+    # - list of events
+    # - {"events":[...]}
+    # - {"data":[...]}
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("events", "data", "calendar", "rows", "items"):
+            if k in data and isinstance(data[k], list):
+                return data[k]
+    return []
 
 
-def get_text(node: ET.Element, tag: str) -> str:
-    child = node.find(tag)
-    if child is None or child.text is None:
-        return ""
-    return child.text.strip()
+def normalize_impact(val) -> str:
+    s = str(val or "").strip().lower()
+    # common values: "High", "Medium", "Low" OR "high" OR "3" etc.
+    if s in ("high", "3", "red"):
+        return "High"
+    if s in ("medium", "2", "orange"):
+        return "Medium"
+    if s in ("low", "1", "yellow"):
+        return "Low"
+    return str(val or "").strip() or "Unknown"
 
 
-def impact_level(impact_raw: str) -> str:
-    s = (impact_raw or "").strip().lower()
-    if "high" in s or "red" in s:
-        return "high"
-    if "medium" in s or "med" in s or "orange" in s:
-        return "medium"
-    if s.isdigit():
-        n = int(s)
-        if n >= 3:
-            return "high"
-        if n == 2:
-            return "medium"
-    return "low"
-
-
-def parse_event_datetime_ny(ev: dict):
+def parse_event_dt_to_et(e: dict) -> datetime | None:
     """
-    Returns (dt_ny, time_known_bool)
-    Prefer Unix timestamp (UTC) then convert -> NY time.
+    Best-effort parsing:
+    Prefer timestamp fields (usually UTC), convert properly to ET.
     """
-    ts = (ev.get("timestamp") or "").strip()
-    if ts.isdigit():
-        n = int(ts)
-        if n > 10_000_000_000:  # ms guard
-            n //= 1000
-        dt_utc = datetime.fromtimestamp(n, tz=UTC_TZ)
-        return dt_utc.astimezone(NY_TZ), True
-
-    date_str = (ev.get("date") or "").strip()
-    time_str = (ev.get("time") or "").strip()
-
-    if not date_str:
-        raise ValueError("missing date")
-
-    if not time_str or time_str.lower() in ("all day", "tentative", "tbd"):
-        d = parser.parse(date_str).date()
-        dt_ny = datetime(d.year, d.month, d.day, 0, 0, tzinfo=NY_TZ)
-        return dt_ny, False
-
-    dt = parser.parse(f"{date_str} {time_str}")
-    # If timezone missing, assume NY time
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY_TZ)
-    else:
-        dt = dt.astimezone(NY_TZ)
-    return dt, True
-
-
-def parse_events(xml_text: str):
-    root = ET.fromstring(xml_text)
-    events = []
-    for node in root.findall(".//event"):
-        # ForexFactory often uses <country>USD</country>
-        country = get_text(node, "country")
-        currency = get_text(node, "currency")
-
-        events.append({
-            "title": get_text(node, "title") or get_text(node, "event") or get_text(node, "name"),
-            "ccy": (country or currency).strip().upper(),
-            "impact": get_text(node, "impact"),
-            "date": get_text(node, "date"),
-            "time": get_text(node, "time"),
-            "timestamp": get_text(node, "timestamp") or get_text(node, "ts") or get_text(node, "timeStamp"),
-        })
-    return events
-
-
-def build_template_b_message(events):
-    lines = []
-    lines.append("@everyone")
-    lines.append("🔴 USD RED FOLDER THIS WEEK (NEW YORK / ET)")
-    lines.append("")
-
-    rows = []
-    usd_any = 0
-    usd_high = 0
-    usd_medium = 0
-
-    for ev in events:
-        if ev["ccy"] == "USD":
-            usd_any += 1
-
-        if ev["ccy"] != "USD":
+    # timestamp fields that appear in exports
+    for key in ("timestamp", "timeStamp", "ts", "date_timestamp", "event_timestamp"):
+        v = e.get(key)
+        if v is None:
             continue
-
-        lvl = impact_level(ev.get("impact", ""))
-        if lvl == "low":
-            continue
-        if lvl == "medium" and not INCLUDE_MEDIUM:
-            continue
-
-        title = (ev.get("title") or "").strip()
-        if not title:
-            continue
-
         try:
-            dt_ny, time_known = parse_event_datetime_ny(ev)
+            n = int(str(v).strip())
+            # milliseconds -> seconds
+            if n > 10_000_000_000:
+                n //= 1000
+            dt_utc = datetime.fromtimestamp(n, tz=timezone.utc)
+            return dt_utc.astimezone(OUT_TZ)
+        except Exception:
+            pass
+
+    # fallback: date + time strings (risky, but better than nothing)
+    date_str = e.get("date") or e.get("day") or e.get("event_date")
+    time_str = e.get("time") or e.get("event_time")
+    if not date_str:
+        return None
+
+    # If time missing, treat as all-day at 12:00 ET
+    if not time_str or str(time_str).strip().lower() in ("all day", "tentative", "na", "n/a"):
+        base = datetime.strptime(str(date_str).strip(), "%Y-%m-%d")
+        return base.replace(tzinfo=OUT_TZ, hour=12, minute=0)
+
+    # Try common formats
+    ds = str(date_str).strip()
+    ts = str(time_str).strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M%p", "%Y-%m-%d %I:%M %p"):
+        try:
+            dt_local = datetime.strptime(f"{ds} {ts}", fmt)
+            return dt_local.replace(tzinfo=OUT_TZ)
         except Exception:
             continue
 
-        t_txt = dt_ny.strftime("%-I:%M %p") if time_known else "TBD"
-        rows.append((dt_ny, t_txt, title, lvl))
+    return None
 
-        if lvl == "high":
-            usd_high += 1
-        elif lvl == "medium":
-            usd_medium += 1
 
-    rows.sort(key=lambda x: x[0])
+def get_title(e: dict) -> str:
+    for k in ("title", "event", "name", "headline"):
+        v = e.get(k)
+        if v:
+            return str(v).strip()
+    return "Unknown Event"
 
-    # Dedup
-    seen = set()
-    dedup = []
-    for dt_ny, t_txt, title, lvl in rows:
-        key = (dt_ny.date().isoformat(), t_txt, title, lvl)
-        if key in seen:
+
+def get_currency(e: dict) -> str:
+    for k in ("currency", "cur", "ccy"):
+        v = e.get(k)
+        if v:
+            return str(v).strip().upper()
+    return ""
+
+
+def build_weekly_message(events: list[dict]) -> str:
+    now_et = datetime.now(OUT_TZ)
+
+    # Decide “this week” window: now -> next 7 days
+    end_et = now_et + timedelta(days=7)
+
+    # Filter + parse
+    picked = []
+    for e in events:
+        ccy = get_currency(e)
+        if ccy != TARGET_CURRENCY:
             continue
-        seen.add(key)
-        dedup.append((dt_ny, t_txt, title, lvl))
 
-    if not dedup:
-        lines.append("- No USD red-folder (HIGH) events found in THISWEEK feed.")
-    else:
-        current_day = None
-        for dt_ny, t_txt, title, _lvl in dedup:
-            if current_day != dt_ny.date():
-                current_day = dt_ny.date()
-                lines.append("")
-                lines.append(f"{dt_ny.strftime('%A').upper()} ({dt_ny.strftime('%b %-d')})")
-            lines.append(f"- {t_txt} ET | {title}")
+        impact = normalize_impact(e.get("impact") or e.get("importance") or e.get("volatility"))
+        if impact not in ALLOWED_IMPACTS:
+            continue
 
-    # Shows in GitHub Actions logs so you can confirm it’s reading USD & impacts
-    print(
-        f"DEBUG: parsed_events={len(events)} | usd_any={usd_any} | usd_high={usd_high} | usd_medium={usd_medium}"
-    )
+        dt_et = parse_event_dt_to_et(e)
+        if dt_et is None:
+            continue
 
-    msg = "\n".join(lines).strip()
-    if len(msg) > MAX_DISCORD_CHARS:
-        msg = msg[:MAX_DISCORD_CHARS] + "\n…(truncated)"
-    return msg
+        # keep only within the next 7 days (weekly digest)
+        if not (now_et <= dt_et <= end_et):
+            continue
+
+        picked.append((dt_et, impact, get_title(e)))
+
+    picked.sort(key=lambda x: x[0])
+
+    header = "@everyone\n🔴 **USD IMPORTANT NEWS (ET) — NEXT 7 DAYS**\n"
+    if not picked:
+        return header + "\n• No USD High/Medium events found in the next 7 days."
+
+    lines = []
+    for dt_et, impact, title in picked:
+        day = dt_et.strftime("%A")           # Wednesday
+        date_txt = dt_et.strftime("%b %-d")  # Feb 18
+        time_txt = dt_et.strftime("%-I:%M %p ET")  # 2:00 PM ET
+        badge = "🔴" if impact == "High" else "🟠"
+        lines.append(f"• {badge} **{day}, {date_txt} — {time_txt}**  — {title}")
+
+    return header + "\n" + "\n".join(lines)
 
 
 def main():
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+    webhook = os.environ.get(DISCORD_WEBHOOK_ENV, "").strip()
     if not webhook:
-        raise SystemExit("Missing DISCORD_WEBHOOK_URL secret/env var")
+        raise RuntimeError("Missing DISCORD_WEBHOOK_URL (GitHub secret).")
 
-    xml_text = fetch_xml(FF_XML_THISWEEK)
-    events = parse_events(xml_text)
+    ff_url = os.environ.get("FF_JSON_URL", "").strip() or DEFAULT_FF_JSON_URL
 
-    msg = build_template_b_message(events)
+    events = fetch_ff_json(ff_url)
+    msg = build_weekly_message(events)
     discord_post(webhook, msg)
 
 
